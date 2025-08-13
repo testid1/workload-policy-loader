@@ -1,8 +1,8 @@
-name: Load Conjur Workload Policy (API Key, Debug)
+name: Load Conjur Workload Policy (API Key, Debug Safe)
 
 on:
   push:
-    branches: ["main"]                       # adjust as needed
+    branches: ["main"]
     paths: ["policy/**", ".github/workflows/**"]
   workflow_dispatch:
 
@@ -14,85 +14,80 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Your policy branch ID (WITHOUT the literal "policy/" prefix)
-      # Examples: data  |  apps/team-a
+      # Your policy branch id WITHOUT the literal "policy/" prefix.
+      # Example: data  |  apps/team-a
       POLICY_BRANCH_ID: data
-      # Flip to "true" ONE TIME to auto-create the branch under its parent
+      # Set to "true" for one run if you want to auto-create the branch.
       AUTO_CREATE_BRANCH: "false"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Authenticate with API key -> short-lived session token (base64)
       - name: Get Conjur session token (API key)
         id: auth
         shell: bash
         env:
           CONJUR_URL:           ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}
+          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}   # e.g. user:ci-loader or host/my-ci-loader
           CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
         run: |
           set -euo pipefail
-
-          # URL-encode login (slashes/colons must be encoded in the path)
           LOGIN_ENC="${CONJUR_AUTHN_LOGIN//\//%2F}"
           LOGIN_ENC="${LOGIN_ENC//:/%3A}"
 
-          # Exchange API key for a session token (raw bytes)
           SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
             curl -s -k --data-binary @- \
               "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate")
-
-          # Base64 encode the token for the Authorization header
           SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
 
           if [ -z "$SESSION_B64" ]; then
             echo "Failed to obtain Conjur session token" >&2
             exit 1
           fi
-
           echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
 
-      # 2) DEBUG + Load policy with the correct URL shape
-      - name: Load workload policy into Conjur (with debug)
+      - name: Load workload policy into Conjur (debugged)
         shell: bash
         env:
-          CONJUR_URL:     ${{ secrets.CONJUR_URL }}
-          CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
+          CONJUR_URL:       ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT:   ${{ secrets.CONJUR_ACCOUNT }}
           POLICY_BRANCH_ID: ${{ env.POLICY_BRANCH_ID }}
           AUTO_CREATE_BRANCH: ${{ env.AUTO_CREATE_BRANCH }}
         run: |
           set -euo pipefail
 
-          echo "=== Repo contents (root) ==="
-          ls -al .
-          echo "=== Repo contents (policy/) ==="
-          ls -al policy || true
-
-          # Ensure payload file exists
+          echo "=== Repo contents (root) ==="; ls -al .
+          echo "=== Repo contents (policy/) ==="; ls -al policy || true
           test -f policy/workload.yaml || { echo "ERROR: policy/workload.yaml not found"; exit 2; }
 
-          AUTH="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
+          AUTH_HEADER="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
 
+          # whoami (write to file to avoid quoting issues)
           echo "=== /whoami ==="
-          curl -k -sS -H "$AUTH" "$CONJUR_URL/whoami" | sed 's/.*/  &/'
+          curl -k -sS -H "$AUTH_HEADER" "$CONJUR_URL/whoami" \
+            -o _whoami.json -w "\nWHOAMI_STATUS:%{http_code}\n"
+          cat _whoami.json; echo
 
-          # Encode ONLY the branch id (do NOT include "policy/")
+          # Encode ONLY the branch id (not the literal 'policy/' segment)
           POLICY_BRANCH_ENC="${POLICY_BRANCH_ID//\//%2F}"
           TARGET_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${POLICY_BRANCH_ENC}"
 
-          echo "Branch ID:           $POLICY_BRANCH_ID"
+          echo "Branch ID: $POLICY_BRANCH_ID"
           echo "Branch ID (encoded): $POLICY_BRANCH_ENC"
-          echo "Target URL:          $TARGET_URL"
+          echo "Target URL: $TARGET_URL"
 
+          # Check visibility of the branch (non-fatal)
           echo "=== Check visibility of policy branch ==="
-          curl -k -sS -H "$AUTH" \
-            "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=policy&search=${POLICY_BRANCH_ID}" | sed 's/.*/  &/'
+          VIS_STATUS=$(curl -k -sS -H "$AUTH_HEADER" \
+            "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=policy&search=${POLICY_BRANCH_ID}" \
+            -o _branch.json -w "%{http_code}")
+          echo "VIS_STATUS:$VIS_STATUS"
+          cat _branch.json; echo
 
-          # Optionally create the branch if missing (needs update on the parent)
-          if [ "${AUTO_CREATE_BRANCH}" = "true" ]; then
+          # Optionally create the branch under its parent (needs 'update' on parent)
+          if [ "$AUTO_CREATE_BRANCH" = "true" ]; then
             echo "=== Ensuring branch '${POLICY_BRANCH_ID}' exists ==="
             if [[ "$POLICY_BRANCH_ID" == *"/"* ]]; then
               PARENT="${POLICY_BRANCH_ID%/*}"
@@ -103,12 +98,23 @@ jobs:
             printf -- "- !policy\n  id: %s\n" "$POLICY_BRANCH_ID" > _create-branch.yml
             CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${PARENT_ENC}"
             echo "Creating under parent: $PARENT  →  $CREATE_URL"
-            curl -k -sS -H "$AUTH" -H "Content-Type: application/x-yaml" \
+            curl -k -sS -H "$AUTH_HEADER" -H "Content-Type: application/x-yaml" \
               -X PATCH "$CREATE_URL" \
               --data-binary @_create-branch.yml \
-              --write-out "\nCREATE_HTTP_STATUS:%{http_code}"
-            echo
+              -o _create_resp.json -w "\nCREATE_HTTP_STATUS:%{http_code}\n"
+            cat _create_resp.json || true; echo
           fi
 
+          # Upload the workload policy
           echo "=== Uploading workload.yaml ($(wc -c < policy/workload.yaml) bytes) ==="
-          curl -k -sS -H "$AUTH
+          HTTP_STATUS=$(curl -k -sS \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/x-yaml" \
+            -X PATCH "$TARGET_URL" \
+            --data-binary @policy/workload.yaml \
+            -o _load_resp.json -w "%{http_code}")
+          echo "HTTP_STATUS:$HTTP_STATUS"
+          cat _load_resp.json || true; echo
+
+          # Fail the job if not 2xx
+          [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]
