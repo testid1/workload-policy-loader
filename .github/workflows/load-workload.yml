@@ -1,109 +1,77 @@
-name: Load Conjur Workload Policy (API Key, create-if-missing)
+name: Get Conjur Variable (API key)
 
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
-    paths: ["policy/**", ".github/workflows/**"]
-  workflow_dispatch:
+    paths: [".github/workflows/get-conjur-variable.yml"]
 
 permissions:
   contents: read
 
 jobs:
-  load-workload:
+  get-secret:
     runs-on: ubuntu-latest
-    env:
-      POLICY_BRANCH_ID: data   # change if needed (e.g., apps/team-a)
-
     steps:
-      - name: Checkout
+      - name: Checkout (optional)
         uses: actions/checkout@v4
 
-      - name: Install jq
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y jq
-
-      - name: Get Conjur session token (API key)
+      - name: Authenticate with Conjur (API key → session)
         id: auth
         shell: bash
         env:
           CONJUR_URL:           ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}   # e.g. host/data/github-app or user:ci-loader
+          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}
           CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
         run: |
           set -euo pipefail
+          # URL-encode the login for the path segment
           LOGIN_ENC="${CONJUR_AUTHN_LOGIN//\//%2F}"
           LOGIN_ENC="${LOGIN_ENC//:/%3A}"
 
+          # Exchange API key for a short-lived session token (raw bytes)
           SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
             curl -s -k --data-binary @- \
               "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate")
+
+          # Base64-encode for the Authorization header
           SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
           test -n "$SESSION_B64" || { echo "Failed to obtain Conjur session token"; exit 1; }
+
           echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
 
-      - name: Create branch if missing, then load policy
+      - name: Fetch variable value (masked)
+        id: getvar
         shell: bash
         env:
-          CONJUR_URL:         ${{ secrets.CONJUR_URL }}
-          CONJUR_ACCOUNT:     ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_AUTHN_LOGIN: ${{ secrets.CONJUR_AUTHN_LOGIN }}
-          POLICY_BRANCH_ID:   ${{ env.POLICY_BRANCH_ID }}
+          CONJUR_URL:     ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
+          CONJUR_VAR_ID:  ${{ vars.CONJUR_VAR_ID }}     # e.g. data/vault/.../password
         run: |
           set -euo pipefail
+          AUTH_HEADER="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
 
-          test -f policy/workload.yaml || { echo "ERROR: policy/workload.yaml not found"; exit 2; }
+          # Encode only the variable id (slashes -> %2F)
+          VAR_ID_ENC="${CONJUR_VAR_ID//\//%2F}"
 
-          AUTH="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
+          # Get the secret value (raw text)
+          SECRET_VALUE=$(curl -s -k -H "$AUTH_HEADER" \
+            "$CONJUR_URL/secrets/${CONJUR_ACCOUNT}/variable/${VAR_ID_ENC}")
 
-          echo "=== /whoami ==="
-          curl -k -sS -H "$AUTH" "$CONJUR_URL/whoami" -o _whoami.json -w "\nWHOAMI_STATUS:%{http_code}\n"
-          cat _whoami.json; echo
+          # Mask it so it never prints in cleartext in logs
+          echo "::add-mask::$SECRET_VALUE"
 
-          BR_ENC="${POLICY_BRANCH_ID//\//%2F}"
-          TARGET_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${BR_ENC}"
-          echo "Target URL: $TARGET_URL"
+          # Expose to later steps without printing it
+          echo "SECRET_VALUE=$SECRET_VALUE" >> "$GITHUB_ENV"
 
-          echo "=== Check if policy branch exists ==="
-          curl -k -sS -H "$AUTH" \
-            "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=policy&search=${POLICY_BRANCH_ID}" \
-            -o _branch.json -w "\nVIS_STATUS:%{http_code}\n"
-          cat _branch.json | jq .
+          # Optional: show a redacted preview
+          echo "Retrieved value for '$CONJUR_VAR_ID' (len: ${#SECRET_VALUE})."
+          echo "Preview: ${SECRET_VALUE:0:3}***"
 
-          # If the array is empty, create the branch under 'root' and grant this identity update
-          if [ "$(jq 'length' _branch.json)" = "0" ]; then
-            echo "Branch '${POLICY_BRANCH_ID}' not visible; attempting create under 'root'..."
-
-            KIND="user"; ROLE_ID="$CONJUR_AUTHN_LOGIN"
-            if [[ "$CONJUR_AUTHN_LOGIN" == host/* ]]; then
-              KIND="host"; ROLE_ID="${CONJUR_AUTHN_LOGIN#host/}"
-            elif [[ "$CONJUR_AUTHN_LOGIN" == user:* ]]; then
-              KIND="user"; ROLE_ID="${CONJUR_AUTHN_LOGIN#user:}"
-            fi
-
-            printf -- "- !policy\n  id: %s\n\n- !permit\n  role: !%s %s\n  privileges: [ update ]\n  resource: !policy %s\n" \
-              "$POLICY_BRANCH_ID" "$KIND" "$ROLE_ID" "$POLICY_BRANCH_ID" > _create-branch.yml
-
-            CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/root"
-            CREATE_STATUS=$(curl -k -sS -H "$AUTH" -H "Content-Type: application/x-yaml" \
-              -X PATCH "$CREATE_URL" --data-binary @_create-branch.yml \
-              -o _create_resp.json -w "%{http_code}")
-            echo "CREATE_STATUS:$CREATE_STATUS"; cat _create_resp.json || true; echo
-
-            if [ "$CREATE_STATUS" -lt 200 ] || [ "$CREATE_STATUS" -ge 300 ]; then
-              echo "::error title=Bootstrap needed:: Could not create policy '${POLICY_BRANCH_ID}'."
-              echo "Ask a Conjur admin to run this one-time bootstrap (under 'root'):"
-              printf -- "- !policy\n  id: %s\n\n- !permit\n  role: !%s %s\n  privileges: [ update ]\n  resource: !policy %s\n" \
-                "$POLICY_BRANCH_ID" "$KIND" "$ROLE_ID" "$POLICY_BRANCH_ID"
-              exit 1
-            fi
-          fi
-
-          echo "=== Load workload.yaml ($(wc -c < policy/workload.yaml) bytes) ==="
-          LOAD_STATUS=$(curl -k -sS -H "$AUTH" -H "Content-Type: application/x-yaml" \
-            -X PATCH "$TARGET_URL" --data-binary @policy/workload.yaml \
-            -o _load_resp.json -w "%{http_code}")
-          echo "HTTP_STATUS:$LOAD_STATUS"; cat _load_resp.json || true; echo
-          [[ "$LOAD_STATUS" -ge 200 && "$LOAD_STATUS" -lt 300 ]]
+      - name: Use the secret in another step (example)
+        run: |
+          echo "I can use \$SECRET_VALUE here without printing it."
+          test -n "$SECRET_VALUE" || { echo "Secret empty"; exit 1; }
+        env:
+          SECRET_VALUE: ${{ env.SECRET_VALUE }}
