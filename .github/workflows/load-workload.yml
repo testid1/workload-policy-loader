@@ -1,7 +1,12 @@
-name: Get Conjur Variable (API key)
+name: Get Conjur Variable (API key, DEBUG)
 
 on:
   workflow_dispatch:
+    inputs:
+      var_id:
+        description: "Conjur variable id (e.g. data/vault/conjurtest/conjurtest/password)"
+        required: false
+        type: string
   push:
     branches: ["main"]
     paths: [".github/workflows/get-conjur-variable.yml"]
@@ -12,13 +17,54 @@ permissions:
 jobs:
   get-secret:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout (optional)
         uses: actions/checkout@v4
 
+      - name: Install jq (for pretty debug)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Debug target / inputs
+        env:
+          CONJUR_URL:           ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
+          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}
+          HAS_API_KEY:          ${{ secrets.CONJUR_AUTHN_API_KEY != '' }}
+          INPUT_VAR_ID:         ${{ github.event.inputs.var_id }}
+          VARS_CONJUR_VAR_ID:   ${{ vars.CONJUR_VAR_ID }}
+        run: |
+          set -euo pipefail
+          echo "=== DEBUG: Target ==="
+          echo "CONJUR_URL        : ${CONJUR_URL}"
+          echo "CONJUR_ACCOUNT    : ${CONJUR_ACCOUNT}"
+          echo "CONJUR_AUTHN_LOGIN: ${CONJUR_AUTHN_LOGIN}"
+          echo "API key provided?  : ${HAS_API_KEY}"
+
+          echo "=== DEBUG: Variable ID sources ==="
+          echo "workflow_dispatch input 'var_id'  : ${INPUT_VAR_ID:-<empty>}"
+          echo "repo variable 'CONJUR_VAR_ID'     : ${VARS_CONJUR_VAR_ID:-<empty>}"
+
+      - name: Resolve variable id
+        id: resolve
+        env:
+          INPUT_VAR_ID:       ${{ github.event.inputs.var_id }}
+          VARS_CONJUR_VAR_ID: ${{ vars.CONJUR_VAR_ID }}
+        run: |
+          set -euo pipefail
+          VAR_ID="${INPUT_VAR_ID:-}"
+          if [ -z "$VAR_ID" ]; then VAR_ID="${VARS_CONJUR_VAR_ID:-}"; fi
+          echo "Resolved CONJUR_VAR_ID: '${VAR_ID}'"
+          if [ -z "$VAR_ID" ]; then
+            echo "::error title=Missing variable id::Provide 'var_id' in workflow_dispatch OR set repo variable CONJUR_VAR_ID."
+            exit 1
+          fi
+          echo "var_id=$VAR_ID" >> "$GITHUB_OUTPUT"
+
       - name: Authenticate with Conjur (API key → session)
         id: auth
-        shell: bash
         env:
           CONJUR_URL:           ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
@@ -26,52 +72,99 @@ jobs:
           CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
         run: |
           set -euo pipefail
-          # URL-encode the login for the path segment
+          # Encode login for path segment (slashes & colon)
           LOGIN_ENC="${CONJUR_AUTHN_LOGIN//\//%2F}"
           LOGIN_ENC="${LOGIN_ENC//:/%3A}"
 
-          # Exchange API key for a short-lived session token (raw bytes)
+          echo "=== DEBUG: Authenticating ==="
+          echo "Authn endpoint: $CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate"
+
           SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
             curl -s -k --data-binary @- \
               "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate")
+          SESSION_LEN=${#SESSION_RAW}
+          echo "Got raw session token (len: $SESSION_LEN)"
 
-          # Base64-encode for the Authorization header
           SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
-          test -n "$SESSION_B64" || { echo "Failed to obtain Conjur session token"; exit 1; }
-
+          test -n "$SESSION_B64" || { echo "::error::Failed to obtain Conjur session token"; exit 1; }
           echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch variable value (masked)
-        id: getvar
-        shell: bash
+          echo "=== DEBUG: /whoami ==="
+          curl -k -sS -H "Authorization: Token token=\"$SESSION_B64\"" \
+            "$CONJUR_URL/whoami" -o _whoami.json -w "\nWHOAMI_STATUS:%{http_code}\n"
+          cat _whoami.json; echo
+
+      - name: Check resource visibility (non-fatal)
         env:
           CONJUR_URL:     ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_VAR_ID:  ${{ vars.CONJUR_VAR_ID }}     # e.g. data/vault/.../password
+          VAR_ID:         ${{ steps.resolve.outputs.var_id }}
         run: |
           set -euo pipefail
-          AUTH_HEADER="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
+          AUTH="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
+          # Try full id search, then tail component search
+          VAR_TAIL="${VAR_ID##*/}"
+          echo "Search 1 (full id): $VAR_ID"
+          curl -k -sS -H "$AUTH" \
+            "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=variable&search=${VAR_ID}" \
+            -o _res_full.json -w "\nSEARCH_FULL_STATUS:%{http_code}\n"
+          cat _res_full.json | jq .
 
-          # Encode only the variable id (slashes -> %2F)
-          VAR_ID_ENC="${CONJUR_VAR_ID//\//%2F}"
+          echo "Search 2 (tail)    : $VAR_TAIL"
+          curl -k -sS -H "$AUTH" \
+            "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=variable&search=${VAR_TAIL}" \
+            -o _res_tail.json -w "\nSEARCH_TAIL_STATUS:%{http_code}\n"
+          cat _res_tail.json | jq .
 
-          # Get the secret value (raw text)
-          SECRET_VALUE=$(curl -s -k -H "$AUTH_HEADER" \
-            "$CONJUR_URL/secrets/${CONJUR_ACCOUNT}/variable/${VAR_ID_ENC}")
+          echo "(Empty results here can be normal if the identity only has execute, not read/list.)"
 
-          # Mask it so it never prints in cleartext in logs
-          echo "::add-mask::$SECRET_VALUE"
-
-          # Expose to later steps without printing it
-          echo "SECRET_VALUE=$SECRET_VALUE" >> "$GITHUB_ENV"
-
-          # Optional: show a redacted preview
-          echo "Retrieved value for '$CONJUR_VAR_ID' (len: ${#SECRET_VALUE})."
-          echo "Preview: ${SECRET_VALUE:0:3}***"
-
-      - name: Use the secret in another step (example)
+      - name: Fetch variable value (masked, with status)
+        id: getvar
+        env:
+          CONJUR_URL:     ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
+          VAR_ID:         ${{ steps.resolve.outputs.var_id }}
         run: |
-          echo "I can use \$SECRET_VALUE here without printing it."
-          test -n "$SECRET_VALUE" || { echo "Secret empty"; exit 1; }
+          set -euo pipefail
+          AUTH="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
+
+          # Encode ONLY the variable id
+          VAR_ID_ENC="${VAR_ID//\//%2F}"
+          GET_URL="$CONJUR_URL/secrets/${CONJUR_ACCOUNT}/variable/${VAR_ID_ENC}"
+
+          echo "=== DEBUG: GET secret ==="
+          echo "URL: $GET_URL"
+
+          HTTP_STATUS=$(curl -k -sS -H "$AUTH" "$GET_URL" -o _secret.bin -w "%{http_code}")
+          echo "HTTP_STATUS:$HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+            SECRET_VALUE=$(cat _secret.bin)
+            echo "Secret length: ${#SECRET_VALUE}"
+            if [ -n "$SECRET_VALUE" ]; then
+              echo "::add-mask::$SECRET_VALUE"
+              echo "SECRET_VALUE=$SECRET_VALUE" >> "$GITHUB_ENV"
+              echo "Retrieved value for '$VAR_ID' (len: ${#SECRET_VALUE})."
+              echo "Preview: ${SECRET_VALUE:0:3}***"
+            else
+              echo "::warning::Secret returned empty body."
+              echo "SECRET_VALUE=" >> "$GITHUB_ENV"
+            fi
+          else
+            echo "=== DEBUG: Error body ==="
+            cat _secret.bin || true; echo
+            case "$HTTP_STATUS" in
+              401) echo "::error::401 Unauthorized: bad login or API key";;
+              403) echo "::error::403 Forbidden: identity lacks EXECUTE on variable '$VAR_ID'";;
+              404) echo "::error::404 Not Found: wrong account/url or identity cannot see this variable (or id is wrong)";;
+              *)   echo "::error::Unexpected HTTP status: $HTTP_STATUS";;
+            esac
+            exit 1
+          fi
+
+      - name: Use the secret (example)
         env:
           SECRET_VALUE: ${{ env.SECRET_VALUE }}
+        run: |
+          set -euo pipefail
+          echo "Using the secret without printing it..."
+          test -n "$SECRET_VALUE" || { echo "Secret empty"; exit 1; }
