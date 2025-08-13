@@ -1,0 +1,11 @@
+# policy/workload.yaml
+- !host
+  id: myspace/app1/gha-runner
+
+- !variable
+  id: myspace/app1/db/password
+
+- !permit
+  role: !host data/myspace/app1/gha-runner
+  privileges: [ read, execute ]
+  resource: !variable myspace/app1/db/password
