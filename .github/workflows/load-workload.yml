@@ -96,7 +96,7 @@ jobs:
             fi
             PARENT_ENC="${PARENT//\//%2F}"
             printf -- "- !policy\n  id: %s\n" "$POLICY_BRANCH_ID" > _create-branch.yml
-            CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${PARENT_ENC}"
+            CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}%2Fpolicy%2F${PARENT_ENC}"
             echo "Creating under parent: $PARENT  →  $CREATE_URL"
             curl -k -sS -H "$AUTH_HEADER" -H "Content-Type: application/x-yaml" \
               -X PATCH "$CREATE_URL" \
