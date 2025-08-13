@@ -1,100 +1,62 @@
-name: Get Conjur Variable (API key)
-
+name: Fetch Conjur Secret
+ 
 on:
-  workflow_dispatch:
   push:
-    branches: ["main"]
-    paths: [".github/workflows/get-conjur-variable.yml"]
-
-permissions:
-  contents: read
-
+    branches: [ main ]
+ 
 jobs:
-  get-secret:
+  retrieve-secret:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout (optional)
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v3
+ 
+    - name: Install curl and jq
+      run: sudo apt-get update && sudo apt-get install -y curl jq
+ 
+    - name: Authenticate to Conjur and retrieve secret
+      env:
+        CONJUR_ACCOUNT: conjur
+        CONJUR_URL: ${{ secrets.CONJUR_URL }}
+        CONJUR_AUTHN_LOGIN: ${{ secrets.CONJUR_AUTHN_LOGIN }}
+        $CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
+      run: |
+        set -e
+ 
+        echo "=============================="
+        echo "Logging into Conjur..."
+        echo "Account: $CONJUR_ACCOUNT"
+        echo "Appliance URL: $CONJUR_APPLIANCE_URL"
+        echo "Authn Login: $CONJUR_AUTHN_LOGIN"
+        echo "=============================="
+ 
+        echo "Authenticating..."
+ 
+        FULL_AUTHN_URL=$CONJUR_APPLIANCE_URL/authn/$CONJUR_ACCOUNT/$CONJUR_AUTHN_LOGIN/authenticate
+        echo "Calling authn URL: $FULL_AUTHN_URL"
+ 
+        # RESPONSE=$(curl -i -s -w "\n%{http_code}" \
+        #   --request POST \
+        #   --data "$CONJUR_AUTHN_API_KEY" \
+        #   "$FULL_AUTHN_URL")
+         AUTHN_TOKEN=$(curl -s -k --request POST \
+         --data "$CONJUR_AUTHN_API_KEY" \
+         "$CONJUR_URL/api/authn/$CONJUR_ACCOUNT/$CONJUR_AUTHN_LOGIN/authenticate" \
+         | base64 | tr -d '\r\n')
+ 
+        echo "Full /authenticate response:"
+        echo "$AUTHN_TOKEN"
 
-      - name: Authenticate with Conjur (API key → session)
-        id: auth
-        shell: bash
-        env:
-          CONJUR_URL:           ${{ secrets.CONJUR_URL }}
-          CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}
-          CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
-        run: |
-          set -euo pipefail
-          # URL-encode the login for the path segment
-          LOGIN_ENC="${CONJUR_AUTHN_LOGIN//\//%2F}"
-          LOGIN_ENC="${LOGIN_ENC//:/%3A}"
-
-          echo "=== DEBUG AUTH ==="
-          echo "CONJUR_URL        : $CONJUR_URL"
-          echo "CONJUR_ACCOUNT    : $CONJUR_ACCOUNT"
-          echo "CONJUR_AUTHN_LOGIN: $CONJUR_AUTHN_LOGIN"
-          echo "Authn endpoint    : $CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate"
-
-          # Exchange API key for a short-lived session token (raw bytes)
-          SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
-            curl -s -k --data-binary @- \
-              "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate")
-          echo "Raw session length: ${#SESSION_RAW}"
-
-          # Base64-encode for the Authorization header
-          SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
-          test -n "$SESSION_B64" || { echo "Failed to obtain Conjur session token"; exit 1; }
-          echo "Base64 session len: ${#SESSION_B64}"
-          echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
-
-      - name: Fetch variable value (masked)
-        id: getvar
-        shell: bash
-        env:
-          CONJUR_URL:     ${{ secrets.CONJUR_URL }}
-          CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_VAR_ID:  ${{ vars.CONJUR_VAR_ID }}     # e.g. data/vault/.../password
-        run: |
-          set -euo pipefail
-          AUTH_HEADER="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
-
-          echo "=== DEBUG GET ==="
-          echo "Raw CONJUR_VAR_ID : '${CONJUR_VAR_ID}'"
-          if [ -z "${CONJUR_VAR_ID}" ]; then
-            echo "::warning::CONJUR_VAR_ID is empty. Set repo variable CONJUR_VAR_ID or pass via dispatch input."
-          fi
-
-          # Encode only the variable id (slashes -> %2F)
-          VAR_ID_ENC="${CONJUR_VAR_ID//\//%2F}"
-          GET_URL="$CONJUR_URL/secrets/${CONJUR_ACCOUNT}/variable/${VAR_ID_ENC}"
-          echo "Encoded VAR_ID     : '${VAR_ID_ENC}'"
-          echo "GET URL            : $GET_URL"
-
-          # Get the secret value (capture body + HTTP status)
-          HTTP_STATUS=$(curl -s -k -H "$AUTH_HEADER" -o _secret.bin -w "%{http_code}" "$GET_URL")
-          BYTES=$(wc -c < _secret.bin | tr -d ' ')
-          echo "HTTP_STATUS        : $HTTP_STATUS"
-          echo "Response bytes     : $BYTES"
-
-          # Read body (don’t print it; mask if non-empty)
-          SECRET_VALUE="$(cat _secret.bin || true)"
-          if [ -n "$SECRET_VALUE" ]; then
-            echo "::add-mask::$SECRET_VALUE"
-          else
-            echo "::warning::Empty secret body (or not found/forbidden)."
-          fi
-
-          # Expose to later steps without printing it
-          echo "SECRET_VALUE=$SECRET_VALUE" >> "$GITHUB_ENV"
-
-          # Redacted preview
-          echo "Retrieved value for '${CONJUR_VAR_ID}' (len: ${#SECRET_VALUE})."
-          echo "Preview: ${SECRET_VALUE:0:3}***"
-
-      - name: Use the secret in another step (example)
-        run: |
-          echo "I can use \$SECRET_VALUE here without printing it."
-          test -n "$SECRET_VALUE" || { echo "Secret empty"; exit 1; }
-        env:
-          SECRET_VALUE: ${{ env.SECRET_VALUE }}
+        echo "Authentication successful"
+        echo "=============================="
+ 
+        echo "Fetching secret...."
+ 
+       
+         SECRET=$(curl -s -k --header "Authorization: Token token=\"$AUTHN_TOKEN\"" \
+        "$CONJUR_APPLIANCE_URL/api/secrets/$CONJUR_ACCOUNT/variable/data%2Fvault%2Fconjurtest%2Fconjurtest%2Faddress")
+ 
+        SECRET_VALUE=$(echo "$SECRET" | head -n1)
+       
+        
+        echo "Retrieved secret: $SECRET_VALUE"
