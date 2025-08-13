@@ -1,0 +1,64 @@
+name: Load Conjur Workload Policy (API Key)
+
+on:
+  push:
+    branches: ["main"]                 # adjust as needed
+    paths: ["policy/**", ".github/workflows/load-workload.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  load-workload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y coreutils jq
+
+      # 1) Authenticate to Conjur using API key to get a short-lived session token
+      - name: Get Conjur session token (API key)
+        id: auth
+        shell: bash
+        env:
+          CONJUR_URL:           ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
+          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}
+          CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
+        run: |
+          set -euo pipefail
+          # The authenticate endpoint expects the API key in the body.
+          SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
+            curl -s -k --data-binary @- \
+              "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$CONJUR_AUTHN_LOGIN/authenticate")
+
+          # Base64-encode the raw token for the Authorization header.
+          SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
+          if [ -z "$SESSION_B64" ]; then
+            echo "Failed to obtain Conjur session token" >&2
+            exit 1
+          fi
+          echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
+
+      # 2) Load (PATCH) your workload policy into the 'data' policy branch
+      - name: Load workload policy into Conjur
+        shell: bash
+        env:
+          CONJUR_URL:     ${{ secrets.CONJUR_URL }}
+          CONJUR_ACCOUNT: ${{ secrets.CONJUR_ACCOUNT }}
+          POLICY_BRANCH:  policy%2Fdata   # URL-encoded "policy/data"
+        run: |
+          set -euo pipefail
+          curl -k -sS \
+            -H "Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\"" \
+            -H "Content-Type: application/x-yaml" \
+            -X PATCH \
+            "$CONJUR_URL/policies/${CONJUR_ACCOUNT}/${POLICY_BRANCH}" \
+            --data-binary "@policy/workload.yaml" \
+            --write-out "\nHTTP_STATUS:%{http_code}"
