@@ -1,4 +1,4 @@
-name: Load Conjur Workload Policy (API Key, Debug Safe)
+name: Load Conjur Workload Policy (API Key, Auto-create)
 
 on:
   push:
@@ -14,11 +14,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Your policy branch id WITHOUT the literal "policy/" prefix.
-      # Example: data  |  apps/team-a
+      # Branch id WITHOUT "policy/". For nesting use "apps/team-a".
       POLICY_BRANCH_ID: data
-      # Set to "true" for one run if you want to auto-create the branch.
-      AUTO_CREATE_BRANCH: "false"
 
     steps:
       - name: Checkout
@@ -30,91 +27,88 @@ jobs:
         env:
           CONJUR_URL:           ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT:       ${{ secrets.CONJUR_ACCOUNT }}
-          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}   # e.g. user:ci-loader or host/my-ci-loader
+          CONJUR_AUTHN_LOGIN:   ${{ secrets.CONJUR_AUTHN_LOGIN }}   # e.g. host/data/github-app or user:ci-loader
           CONJUR_AUTHN_API_KEY: ${{ secrets.CONJUR_AUTHN_API_KEY }}
         run: |
           set -euo pipefail
           LOGIN_ENC="${CONJUR_AUTHN_LOGIN//\//%2F}"
           LOGIN_ENC="${LOGIN_ENC//:/%3A}"
-
           SESSION_RAW=$(printf %s "$CONJUR_AUTHN_API_KEY" | \
             curl -s -k --data-binary @- \
               "$CONJUR_URL/authn/$CONJUR_ACCOUNT/$LOGIN_ENC/authenticate")
           SESSION_B64=$(printf %s "$SESSION_RAW" | base64 | tr -d '\r\n')
-
-          if [ -z "$SESSION_B64" ]; then
-            echo "Failed to obtain Conjur session token" >&2
-            exit 1
-          fi
+          test -n "$SESSION_B64" || { echo "Failed to obtain Conjur session token"; exit 1; }
           echo "session_b64=$SESSION_B64" >> "$GITHUB_OUTPUT"
 
-      - name: Load workload policy into Conjur (debugged)
+      - name: Load workload policy into Conjur (debugged + auto-create)
         shell: bash
         env:
           CONJUR_URL:       ${{ secrets.CONJUR_URL }}
           CONJUR_ACCOUNT:   ${{ secrets.CONJUR_ACCOUNT }}
           POLICY_BRANCH_ID: ${{ env.POLICY_BRANCH_ID }}
-          AUTO_CREATE_BRANCH: ${{ env.AUTO_CREATE_BRANCH }}
+          CONJUR_AUTHN_LOGIN: ${{ secrets.CONJUR_AUTHN_LOGIN }}
         run: |
           set -euo pipefail
 
-          echo "=== Repo contents (root) ==="; ls -al .
           echo "=== Repo contents (policy/) ==="; ls -al policy || true
           test -f policy/workload.yaml || { echo "ERROR: policy/workload.yaml not found"; exit 2; }
 
           AUTH_HEADER="Authorization: Token token=\"${{ steps.auth.outputs.session_b64 }}\""
 
-          # whoami (write to file to avoid quoting issues)
           echo "=== /whoami ==="
-          curl -k -sS -H "$AUTH_HEADER" "$CONJUR_URL/whoami" \
-            -o _whoami.json -w "\nWHOAMI_STATUS:%{http_code}\n"
+          curl -k -sS -H "$AUTH_HEADER" "$CONJUR_URL/whoami" -o _whoami.json -w "\nWHOAMI_STATUS:%{http_code}\n"
           cat _whoami.json; echo
 
-          # Encode ONLY the branch id (not the literal 'policy/' segment)
-          POLICY_BRANCH_ENC="${POLICY_BRANCH_ID//\//%2F}"
-          TARGET_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${POLICY_BRANCH_ENC}"
-
-          echo "Branch ID: $POLICY_BRANCH_ID"
-          echo "Branch ID (encoded): $POLICY_BRANCH_ENC"
+          # Encode ONLY the branch id (not the 'policy/' segment)
+          BR_ENC="${POLICY_BRANCH_ID//\//%2F}"
+          TARGET_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/${BR_ENC}"
           echo "Target URL: $TARGET_URL"
 
-          # Check visibility of the branch (non-fatal)
-          echo "=== Check visibility of policy branch ==="
+          # Check if branch is visible (empty array means not found or no list rights)
           VIS_STATUS=$(curl -k -sS -H "$AUTH_HEADER" \
             "$CONJUR_URL/resources/${CONJUR_ACCOUNT}?kind=policy&search=${POLICY_BRANCH_ID}" \
             -o _branch.json -w "%{http_code}")
-          echo "VIS_STATUS:$VIS_STATUS"
-          cat _branch.json; echo
+          echo "VIS_STATUS:$VIS_STATUS"; cat _branch.json; echo
 
-          # Optionally create the branch under its parent (needs 'update' on parent)
-          if [ "$AUTO_CREATE_BRANCH" = "true" ]; then
-            echo "=== Ensuring branch '${POLICY_BRANCH_ID}' exists ==="
-            if [[ "$POLICY_BRANCH_ID" == *"/"* ]]; then
-              PARENT="${POLICY_BRANCH_ID%/*}"
-            else
-              PARENT="root"
+          if grep -q '^\[\s*\]\s*$' _branch.json; then
+            echo "=== Branch '${POLICY_BRANCH_ID}' not visible; attempting to create under 'root' and grant update ==="
+            # Determine role kind/id from CONJUR_AUTHN_LOGIN for the permit
+            KIND="user"; ROLE_ID="$CONJUR_AUTHN_LOGIN"
+            if [[ "$CONJUR_AUTHN_LOGIN" == host/* ]]; then
+              KIND="host"; ROLE_ID="${CONJUR_AUTHN_LOGIN#host/}"
+            elif [[ "$CONJUR_AUTHN_LOGIN" == user:* ]]; then
+              KIND="user"; ROLE_ID="${CONJUR_AUTHN_LOGIN#user:}"
             fi
-            PARENT_ENC="${PARENT//\//%2F}"
-            printf -- "- !policy\n  id: %s\n" "$POLICY_BRANCH_ID" > _create-branch.yml
-            CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}%2Fpolicy%2F${PARENT_ENC}"
-            echo "Creating under parent: $PARENT  →  $CREATE_URL"
-            curl -k -sS -H "$AUTH_HEADER" -H "Content-Type: application/x-yaml" \
-              -X PATCH "$CREATE_URL" \
-              --data-binary @_create-branch.yml \
-              -o _create_resp.json -w "\nCREATE_HTTP_STATUS:%{http_code}\n"
-            cat _create_resp.json || true; echo
+
+            cat > _create-branch.yml <<EOF
+- !policy
+  id: ${POLICY_BRANCH_ID}
+
+- !permit
+  role: !${KIND} ${ROLE_ID}
+  privileges: [ update ]
+  resource: !policy ${POLICY_BRANCH_ID}
+EOF
+            # Create under parent 'root'
+            CREATE_URL="$CONJUR_URL/policies/${CONJUR_ACCOUNT}/policy/root"
+            echo "Creating at: $CREATE_URL"
+            CREATE_STATUS=$(curl -k -sS -H "$AUTH_HEADER" -H "Content-Type: application/x-yaml" \
+              -X PATCH "$CREATE_URL" --data-binary @_create-branch.yml \
+              -o _create_resp.json -w "%{http_code}")
+            echo "CREATE_STATUS:$CREATE_STATUS"; cat _create_resp.json || true; echo
+
+            # If we couldn't create (likely 403), fail with a clear message
+            if [ "$CREATE_STATUS" -lt 200 ] || [ "$CREATE_STATUS" -ge 300 ]; then
+              echo "::error title=Bootstrap needed::Failed to create branch '${POLICY_BRANCH_ID}'. An admin must bootstrap it or grant update on 'root'."
+              echo "Suggested bootstrap policy:"
+              echo "- !policy\n  id: ${POLICY_BRANCH_ID}\n- !permit\n  role: !${KIND} ${ROLE_ID}\n  privileges: [ update ]\n  resource: !policy ${POLICY_BRANCH_ID}"
+              exit 1
+            fi
           fi
 
-          # Upload the workload policy
           echo "=== Uploading workload.yaml ($(wc -c < policy/workload.yaml) bytes) ==="
-          HTTP_STATUS=$(curl -k -sS \
-            -H "$AUTH_HEADER" \
-            -H "Content-Type: application/x-yaml" \
-            -X PATCH "$TARGET_URL" \
-            --data-binary @policy/workload.yaml \
+          LOAD_STATUS=$(curl -k -sS -H "$AUTH_HEADER" -H "Content-Type: application/x-yaml" \
+            -X PATCH "$TARGET_URL" --data-binary @policy/workload.yaml \
             -o _load_resp.json -w "%{http_code}")
-          echo "HTTP_STATUS:$HTTP_STATUS"
-          cat _load_resp.json || true; echo
-
-          # Fail the job if not 2xx
-          [[ "$HTTP_STATUS" -ge 200 && "$HTTP_STATUS" -lt 300 ]]
+          echo "HTTP_STATUS:$LOAD_STATUS"; cat _load_resp.json || true; echo
+          [[ "$LOAD_STATUS" -ge 200 && "$LOAD_STATUS" -lt 300 ]]
